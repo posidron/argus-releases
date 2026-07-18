@@ -1,0 +1,356 @@
+name: Publish ARGUS desktop release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Private ARGUS source tag to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: argus-public-release-${{ inputs.tag }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  resolve:
+    name: Resolve private source
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.source.outputs.version }}
+      tag: ${{ steps.source.outputs.tag }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          path: builder
+
+      - name: Set up trusted Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Check out qualified private source tag quietly
+        env:
+          ARGUS_DEPLOY_KEY: ${{ secrets.ARGUS_SOURCE_DEPLOY_KEY }}
+          ARGUS_PRIVATE_REF: refs/tags/${{ inputs.tag }}
+          ARGUS_PRIVATE_DESTINATION: ${{ github.workspace }}/source
+          ARGUS_KNOWN_HOSTS: ${{ github.workspace }}/builder/keys/github-known-hosts
+        run: python builder/tools/checkout_private.py
+
+      - name: Validate source manifests without executing source code
+        id: source
+        env:
+          SOURCE_TAG: ${{ inputs.tag }}
+        run: |
+          python3 builder/tools/validate_source.py \
+            --source source \
+            --tag "${SOURCE_TAG}" \
+            --github-output "${GITHUB_OUTPUT}"
+
+  prepare:
+    name: Prepare public draft
+    needs: resolve
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.release.outputs.release_id }}
+      draft: ${{ steps.release.outputs.draft }}
+    steps:
+      - name: Create or resume draft
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          body="$(
+            printf '%s\n' \
+              'Native ARGUS desktop installers with the Python intelligence backend bundled in.' \
+              '' \
+              "- Private source tag: ${TAG}" \
+              "- Private source commit: ${SOURCE_SHA}" \
+              '- macOS Apple Silicon (arm64 DMG)' \
+              '- macOS Intel (x64 DMG)' \
+              '- Windows x64 (NSIS setup executable and MSI)' \
+              '' \
+              'These builds are currently unsigned. macOS Gatekeeper or Windows SmartScreen may require explicit approval before first launch.'
+          )"
+          existing="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq '.[] | [.tag_name, .id, .draft] | @tsv' |
+              awk -F $'\t' -v tag="${TAG}" '
+                $1 == tag && !found {
+                  selected = $2 "\t" $3
+                  found = 1
+                }
+                END {
+                  if (found) print selected
+                }
+              '
+          )"
+          if [[ -n "${existing}" ]]; then
+            IFS=$'\t' read -r release_id draft <<< "${existing}"
+            if [[ "${draft}" != "true" ]]; then
+              echo "Release ${TAG} is already published; refusing to replace live assets." >&2
+              exit 1
+            fi
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+              -f name="ARGUS ${TAG}" \
+              -f body="${body}" \
+              --silent
+          else
+            created="$(
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
+                -f tag_name="${TAG}" \
+                -f target_commitish="${GITHUB_SHA}" \
+                -f name="ARGUS ${TAG}" \
+                -f body="${body}" \
+                -F draft=true \
+                -F prerelease=false
+            )"
+            release_id="$(jq -r '.id' <<< "${created}")"
+            draft="$(jq -r '.draft' <<< "${created}")"
+          fi
+          echo "release_id=${release_id}" >> "${GITHUB_OUTPUT}"
+          echo "draft=${draft}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build ${{ matrix.asset_label }}
+    needs:
+      - resolve
+      - prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            bundles: dmg
+            asset_label: macOS_arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: dmg
+            asset_label: macOS_x64
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            bundles: nsis,msi
+            asset_label: Windows_x64
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          path: builder
+
+      - name: Set up trusted Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Check out immutable private source quietly
+        env:
+          ARGUS_DEPLOY_KEY: ${{ secrets.ARGUS_SOURCE_DEPLOY_KEY }}
+          ARGUS_PRIVATE_REF: ${{ needs.resolve.outputs.source_sha }}
+          ARGUS_PRIVATE_DESTINATION: ${{ github.workspace }}/source
+          ARGUS_KNOWN_HOSTS: ${{ github.workspace }}/builder/keys/github-known-hosts
+        run: python builder/tools/checkout_private.py
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          working-directory: source
+          python-version: "3.12"
+          activate-environment: true
+          enable-cache: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build and smoke-test private source quietly
+        env:
+          ARGUS_TARGET: ${{ matrix.target }}
+          ARGUS_BUNDLES: ${{ matrix.bundles }}
+        run: python builder/tools/build_source.py
+
+      - name: Check out fresh trusted packager
+        if: always()
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: packager
+
+      - name: Encrypt verified installer output
+        env:
+          ARGUS_SOURCE_ROOT: ${{ github.workspace }}/source
+          ARGUS_TARGET: ${{ matrix.target }}
+          ARGUS_VERSION: ${{ needs.resolve.outputs.version }}
+          ARGUS_LABEL: ${{ matrix.asset_label }}
+          ARGUS_OUTPUT: ${{ runner.temp }}/argus-encrypted
+          ARGUS_PUBLIC_KEY_PATH: ${{ github.workspace }}/packager/keys/artifact-public.pem
+        run: node packager/tools/encrypted_artifacts.mjs pack
+
+      - name: Upload encrypted installer payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ARGUS-package-${{ matrix.asset_label }}
+          path: ${{ runner.temp }}/argus-encrypted/*.enc
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+      - name: Encrypt private build logs on failure
+        if: failure()
+        continue-on-error: true
+        env:
+          ARGUS_INPUT: ${{ runner.temp }}/argus-private-logs
+          ARGUS_OUTPUT: ${{ runner.temp }}/argus-encrypted-logs
+          ARGUS_LABEL: ${{ matrix.asset_label }}
+          ARGUS_PUBLIC_KEY_PATH: ${{ github.workspace }}/packager/keys/artifact-public.pem
+        run: node packager/tools/encrypted_artifacts.mjs encrypt-logs
+
+      - name: Upload encrypted failure logs
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ARGUS-debug-${{ matrix.asset_label }}
+          path: ${{ runner.temp }}/argus-encrypted-logs/*.enc
+          if-no-files-found: ignore
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+  publish:
+    name: Verify and publish public release
+    needs:
+      - resolve
+      - prepare
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          path: builder
+
+      - name: Set up trusted Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Recheck qualified private source tag quietly
+        env:
+          ARGUS_DEPLOY_KEY: ${{ secrets.ARGUS_SOURCE_DEPLOY_KEY }}
+          ARGUS_PRIVATE_REF: refs/tags/${{ needs.resolve.outputs.tag }}
+          ARGUS_PRIVATE_DESTINATION: ${{ github.workspace }}/source-check
+          ARGUS_KNOWN_HOSTS: ${{ github.workspace }}/builder/keys/github-known-hosts
+          ARGUS_METADATA_ONLY: "true"
+        run: python builder/tools/checkout_private.py
+
+      - name: Download encrypted installer payloads
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: ARGUS-package-*
+          path: encrypted
+          merge-multiple: true
+
+      - name: Decrypt and verify exact installer set
+        env:
+          ARGUS_INPUT: ${{ github.workspace }}/encrypted
+          ARGUS_OUTPUT: ${{ github.workspace }}/release-assets
+          ARGUS_VERSION: ${{ needs.resolve.outputs.version }}
+          ARGUS_ARTIFACT_PRIVATE_KEY: ${{ secrets.ARGUS_ARTIFACT_PRIVATE_KEY }}
+        run: node builder/tools/encrypted_artifacts.mjs unpack
+
+      - name: Publish verified installers
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          current_source_sha="$(git -C source-check rev-parse HEAD)"
+          if [[ "${current_source_sha}" != "${SOURCE_SHA}" ]]; then
+            echo "Private source tag ${TAG} moved from ${SOURCE_SHA} to ${current_source_sha}." >&2
+            exit 1
+          fi
+
+          release_json="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}"
+          )"
+          if [[ "$(jq -r '.tag_name' <<< "${release_json}")" != "${TAG}" ]]; then
+            echo "Release ${RELEASE_ID} no longer belongs to ${TAG}." >&2
+            exit 1
+          fi
+          if [[ "$(jq -r '.draft' <<< "${release_json}")" != "true" ]]; then
+            echo "Release ${TAG} is no longer a draft; refusing to modify it." >&2
+            exit 1
+          fi
+
+          while read -r asset_id; do
+            [[ -z "${asset_id}" ]] && continue
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              --silent
+          done < <(jq -r '.assets[].id' <<< "${release_json}")
+
+          gh release upload "${TAG}" release-assets/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+
+          release_json="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}"
+          )"
+          actual="$(jq -r '.assets[].name' <<< "${release_json}" | sort)"
+          expected="$(
+            printf '%s\n' \
+              "ARGUS_${VERSION}_macOS_arm64.dmg" \
+              "ARGUS_${VERSION}_macOS_x64.dmg" \
+              "ARGUS_${VERSION}_Windows_x64-setup.exe" \
+              "ARGUS_${VERSION}_Windows_x64.msi" |
+              sort
+          )"
+          if [[ "${actual}" != "${expected}" ]]; then
+            echo "Published asset set does not match the four-file allowlist." >&2
+            echo "Actual assets:" >&2
+            echo "${actual}" >&2
+            exit 1
+          fi
+
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -F draft=false \
+            -f make_latest=legacy \
+            --silent
+          echo "Published ${TAG} with all native desktop installers."
