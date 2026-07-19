@@ -50,7 +50,10 @@ Public GitHub Actions release workflow
 ## Release integrity
 
 1. Metadata checks out the requested private tag and runs the source repository's
-   manifest-version validator.
+   manifest-version validator. The trusted preparation job records one release ID
+   and normalizes GitHub's temporary `untagged-*` draft identity to the requested
+   version tag before native jobs start. A conflicting standalone public tag is
+   rejected rather than silently reused.
 2. The resolved source commit SHA is passed to every native matrix job; jobs never
    rebuild a moving branch or tag.
 3. Each read-scoped runner creates the architecture-matched PyInstaller sidecar and runs its
@@ -62,11 +65,13 @@ Public GitHub Actions release workflow
    one-day retention.
 5. The publisher checks out only the private tag metadata, verifies it still resolves
    to the original SHA, decrypts and validates all hashes and sizes, and checks the
-   draft identity.
+   normalized draft identity by release ID.
 6. Existing draft assets are removed, then exactly both DMGs, the NSIS setup
-   executable and MSI are uploaded.
-7. Only then is the release made public. Failed builds leave a resumable draft;
-   published releases are never modified by a rerun.
+   executable and MSI are uploaded through the selected release ID.
+7. The publisher first establishes the exact public tag at the trusted builder
+   commit, then makes the complete canonical release identity public. A fresh API
+   read verifies the tag target and exact asset set. Failed builds leave a resumable
+   draft; published releases are never modified by a rerun.
 
 ## Signing boundary
 

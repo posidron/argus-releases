@@ -75,6 +75,32 @@ jobs:
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
         run: |
           set -euo pipefail
+          peel_tag_object() {
+            local object_type="$1"
+            local object_sha="$2"
+            local depth=0
+            local tag_json
+
+            while [[ "${object_type}" == "tag" ]]; do
+              depth=$((depth + 1))
+              if (( depth > 8 )); then
+                echo "Tag ${TAG} exceeds the supported annotation depth." >&2
+                return 1
+              fi
+              tag_json="$(
+                gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}"
+              )"
+              object_type="$(jq -r '.object.type' <<< "${tag_json}")"
+              object_sha="$(jq -r '.object.sha' <<< "${tag_json}")"
+            done
+
+            if [[ "${object_type}" != "commit" || ! "${object_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Tag ${TAG} does not resolve to a commit." >&2
+              return 1
+            fi
+            printf '%s\n' "${object_sha}"
+          }
+
           body="$(
             printf '%s\n' \
               'Native ARGUS desktop installers with the Python intelligence backend bundled in.' \
@@ -87,43 +113,85 @@ jobs:
               '' \
               'These builds are currently unsigned. macOS Gatekeeper or Windows SmartScreen may require explicit approval before first launch.'
           )"
-          existing="$(
+          release_name="ARGUS ${TAG}"
+          matches="$(
             gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-              --jq '.[] | [.tag_name, .id, .draft] | @tsv' |
-              awk -F $'\t' -v tag="${TAG}" '
-                $1 == tag && !found {
-                  selected = $2 "\t" $3
-                  found = 1
-                }
-                END {
-                  if (found) print selected
+              --jq '.[] | [.tag_name, .id, .draft, .name] | @tsv' |
+              awk -F $'\t' -v tag="${TAG}" -v name="${release_name}" '
+                $1 == tag ||
+                ($1 ~ /^untagged-[[:alnum:]]+$/ && $3 == "true" && $4 == name) {
+                  print $2 "\t" $3 "\t" $1
                 }
               '
           )"
-          if [[ -n "${existing}" ]]; then
-            IFS=$'\t' read -r release_id draft <<< "${existing}"
+          match_count="$(awk 'NF { count += 1 } END { print count + 0 }' <<< "${matches}")"
+          if (( match_count > 1 )); then
+            echo "Multiple releases match ${TAG}; refusing ambiguous draft recovery." >&2
+            exit 1
+          fi
+
+          if [[ -n "${matches}" ]]; then
+            IFS=$'\t' read -r release_id draft _release_tag <<< "${matches}"
             if [[ "${draft}" != "true" ]]; then
               echo "Release ${TAG} is already published; refusing to replace live assets." >&2
               exit 1
             fi
-            gh api --method PATCH \
-              "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
-              -f name="ARGUS ${TAG}" \
-              -f body="${body}" \
-              --silent
           else
+            release_id=""
+          fi
+
+          tag_ref="$(
+            gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${TAG}" |
+              jq -r --arg ref "refs/tags/${TAG}" '
+                [.[] | select(.ref == $ref)] |
+                if length > 1
+                then error("multiple exact tag references")
+                elif length == 1
+                then .[0] | [.object.type, .object.sha] | @tsv
+                else empty
+                end
+              '
+          )"
+          if [[ -n "${tag_ref}" ]]; then
+            IFS=$'\t' read -r tag_type tag_object_sha <<< "${tag_ref}"
+            tag_sha="$(peel_tag_object "${tag_type}" "${tag_object_sha}")"
+            if [[ "${tag_sha}" != "${GITHUB_SHA}" ]]; then
+              echo "Existing public tag ${TAG} points to ${tag_sha}, not trusted builder ${GITHUB_SHA}." >&2
+              exit 1
+            fi
+          fi
+
+          if [[ -z "${release_id}" ]]; then
             created="$(
               gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
                 -f tag_name="${TAG}" \
                 -f target_commitish="${GITHUB_SHA}" \
-                -f name="ARGUS ${TAG}" \
+                -f name="${release_name}" \
                 -f body="${body}" \
                 -F draft=true \
                 -F prerelease=false
             )"
             release_id="$(jq -r '.id' <<< "${created}")"
-            draft="$(jq -r '.draft' <<< "${created}")"
           fi
+
+          release_json="$(
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+              -f tag_name="${TAG}" \
+              -f target_commitish="${GITHUB_SHA}" \
+              -f name="${release_name}" \
+              -f body="${body}"
+          )"
+          if [[ "$(jq -r '.tag_name' <<< "${release_json}")" != "${TAG}" ]]; then
+            echo "Draft ${release_id} did not retain requested tag ${TAG}." >&2
+            exit 1
+          fi
+          draft="$(jq -r '.draft' <<< "${release_json}")"
+          if [[ "${draft}" != "true" ]]; then
+            echo "Release ${TAG} stopped being a draft during preparation." >&2
+            exit 1
+          fi
+
           echo "release_id=${release_id}" >> "${GITHUB_OUTPUT}"
           echo "draft=${draft}" >> "${GITHUB_OUTPUT}"
 
@@ -299,8 +367,146 @@ jobs:
           TAG: ${{ needs.resolve.outputs.tag }}
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+          BUILDER_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          peel_tag_object() {
+            local object_type="$1"
+            local object_sha="$2"
+            local depth=0
+            local tag_json
+
+            while [[ "${object_type}" == "tag" ]]; do
+              depth=$((depth + 1))
+              if (( depth > 8 )); then
+                echo "Tag ${TAG} exceeds the supported annotation depth." >&2
+                return 1
+              fi
+              tag_json="$(
+                gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}"
+              )"
+              object_type="$(jq -r '.object.type' <<< "${tag_json}")"
+              object_sha="$(jq -r '.object.sha' <<< "${tag_json}")"
+            done
+
+            if [[ "${object_type}" != "commit" || ! "${object_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Tag ${TAG} does not resolve to a commit." >&2
+              return 1
+            fi
+            printf '%s\n' "${object_sha}"
+          }
+
+          verify_release_identity() {
+            local document="$1"
+            local expected_draft="$2"
+            if ! jq -e \
+              --arg tag "${TAG}" \
+              --arg name "ARGUS ${TAG}" \
+              --argjson draft "${expected_draft}" \
+              '.tag_name == $tag and .name == $name and .draft == $draft and .prerelease == false' \
+              <<< "${document}" >/dev/null; then
+              echo "Release ${RELEASE_ID} failed canonical identity verification." >&2
+              return 1
+            fi
+          }
+
+          expected="$(
+            printf '%s\n' \
+              "ARGUS_${VERSION}_macOS_arm64.dmg" \
+              "ARGUS_${VERSION}_macOS_x64.dmg" \
+              "ARGUS_${VERSION}_Windows_x64-setup.exe" \
+              "ARGUS_${VERSION}_Windows_x64.msi" |
+              sort
+          )"
+
+          verify_release_assets() {
+            local document="$1"
+            local actual
+            local file
+            local name
+            local local_size
+            local local_digest
+            local remote_size
+            local remote_digest
+            local remote_state
+
+            actual="$(jq -r '.assets[].name' <<< "${document}" | sort)"
+            if [[ "${actual}" != "${expected}" ]]; then
+              echo "Release asset set does not match the four-file allowlist." >&2
+              echo "Actual assets:" >&2
+              echo "${actual}" >&2
+              return 1
+            fi
+
+            while IFS= read -r file; do
+              name="$(basename "${file}")"
+              local_size="$(wc -c < "${file}" | tr -d '[:space:]')"
+              local_digest="sha256:$(sha256sum "${file}" | awk '{print $1}')"
+              remote_size="$(
+                jq -r --arg name "${name}" '.assets[] | select(.name == $name) | .size' \
+                  <<< "${document}"
+              )"
+              remote_digest="$(
+                jq -r --arg name "${name}" '.assets[] | select(.name == $name) | .digest' \
+                  <<< "${document}"
+              )"
+              remote_state="$(
+                jq -r --arg name "${name}" '.assets[] | select(.name == $name) | .state' \
+                  <<< "${document}"
+              )"
+              if [[ "${remote_state}" != "uploaded" ||
+                    "${remote_size}" != "${local_size}" ||
+                    "${remote_digest}" != "${local_digest}" ]]; then
+                echo "Release asset ${name} failed size or SHA-256 verification." >&2
+                return 1
+              fi
+            done < <(find release-assets -maxdepth 1 -type f -print | sort)
+          }
+
+          verify_public_tag() {
+            local tag_json
+            local tag_type
+            local tag_object_sha
+            local tag_sha
+
+            tag_json="$(
+              gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}"
+            )"
+            tag_type="$(jq -r '.object.type' <<< "${tag_json}")"
+            tag_object_sha="$(jq -r '.object.sha' <<< "${tag_json}")"
+            tag_sha="$(peel_tag_object "${tag_type}" "${tag_object_sha}")"
+            if [[ "${tag_sha}" != "${BUILDER_SHA}" ]]; then
+              echo "Published tag ${TAG} points to ${tag_sha}, not ${BUILDER_SHA}." >&2
+              return 1
+            fi
+          }
+
+          ensure_public_tag() {
+            local tag_ref
+
+            tag_ref="$(
+              gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${TAG}" |
+                jq -r --arg ref "refs/tags/${TAG}" '
+                  [.[] | select(.ref == $ref)] |
+                  if length > 1
+                  then error("multiple exact tag references")
+                  elif length == 1
+                  then .[0].ref
+                  else empty
+                  end
+                '
+            )"
+            if [[ -z "${tag_ref}" ]]; then
+              if ! gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+                -f ref="refs/tags/${TAG}" \
+                -f sha="${BUILDER_SHA}" \
+                --silent; then
+                echo "Public tag creation raced; verifying the resulting exact tag." >&2
+              fi
+            fi
+            verify_public_tag
+          }
+
           current_source_sha="$(git -C source-check rev-parse HEAD)"
           if [[ "${current_source_sha}" != "${SOURCE_SHA}" ]]; then
             echo "Private source tag ${TAG} moved from ${SOURCE_SHA} to ${current_source_sha}." >&2
@@ -310,14 +516,19 @@ jobs:
           release_json="$(
             gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}"
           )"
-          if [[ "$(jq -r '.tag_name' <<< "${release_json}")" != "${TAG}" ]]; then
-            echo "Release ${RELEASE_ID} no longer belongs to ${TAG}." >&2
+          draft="$(jq -r '.draft' <<< "${release_json}")"
+          if [[ "${draft}" == "false" ]]; then
+            verify_release_identity "${release_json}" false
+            verify_release_assets "${release_json}"
+            verify_public_tag
+            echo "Release ${TAG} was already published and is fully verified."
+            exit 0
+          fi
+          if [[ "${draft}" != "true" ]]; then
+            echo "Release ${RELEASE_ID} has an invalid draft state." >&2
             exit 1
           fi
-          if [[ "$(jq -r '.draft' <<< "${release_json}")" != "true" ]]; then
-            echo "Release ${TAG} is no longer a draft; refusing to modify it." >&2
-            exit 1
-          fi
+          verify_release_identity "${release_json}" true
 
           while read -r asset_id; do
             [[ -z "${asset_id}" ]] && continue
@@ -326,31 +537,58 @@ jobs:
               --silent
           done < <(jq -r '.assets[].id' <<< "${release_json}")
 
-          gh release upload "${TAG}" release-assets/* \
-            --repo "${GITHUB_REPOSITORY}" \
-            --clobber
+          upload_url="$(jq -r '.upload_url | sub("\\{.*$"; "")' <<< "${release_json}")"
+          expected_upload_url="https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets"
+          if [[ "${upload_url}" != "${expected_upload_url}" ]]; then
+            echo "Release ${RELEASE_ID} returned an unexpected upload URL." >&2
+            exit 1
+          fi
+          while IFS= read -r file; do
+            name="$(basename "${file}")"
+            if [[ ! "${name}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "Release asset name ${name} is not URL-safe." >&2
+              exit 1
+            fi
+            upload_response="$(
+              curl --fail-with-body --silent --show-error \
+                --request POST \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "Accept: application/vnd.github+json" \
+                --header "Content-Type: application/octet-stream" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                --data-binary "@${file}" \
+                "${upload_url}?name=${name}"
+            )"
+            if [[ "$(jq -r '.name' <<< "${upload_response}")" != "${name}" ]]; then
+              echo "GitHub returned an unexpected asset after uploading ${name}." >&2
+              exit 1
+            fi
+          done < <(find release-assets -maxdepth 1 -type f -print | sort)
 
           release_json="$(
             gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}"
           )"
-          actual="$(jq -r '.assets[].name' <<< "${release_json}" | sort)"
-          expected="$(
-            printf '%s\n' \
-              "ARGUS_${VERSION}_macOS_arm64.dmg" \
-              "ARGUS_${VERSION}_macOS_x64.dmg" \
-              "ARGUS_${VERSION}_Windows_x64-setup.exe" \
-              "ARGUS_${VERSION}_Windows_x64.msi" |
-              sort
-          )"
-          if [[ "${actual}" != "${expected}" ]]; then
-            echo "Published asset set does not match the four-file allowlist." >&2
-            echo "Actual assets:" >&2
-            echo "${actual}" >&2
-            exit 1
-          fi
+          verify_release_identity "${release_json}" true
+          verify_release_assets "${release_json}"
 
-          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
-            -F draft=false \
-            -f make_latest=legacy \
-            --silent
+          ensure_public_tag
+          release_body="$(jq -r '.body // ""' <<< "${release_json}")"
+          published_json="$(
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+              -f tag_name="${TAG}" \
+              -f target_commitish="${BUILDER_SHA}" \
+              -f name="ARGUS ${TAG}" \
+              -f body="${release_body}" \
+              -F draft=false \
+              -F prerelease=false \
+              -f make_latest=legacy
+          )"
+          verify_release_identity "${published_json}" false
+
+          published_json="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}"
+          )"
+          verify_release_identity "${published_json}" false
+          verify_release_assets "${published_json}"
+          verify_public_tag
           echo "Published ${TAG} with all native desktop installers."

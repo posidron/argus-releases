@@ -29,14 +29,16 @@ source tag such as `v0.3.0`. The workflow:
 
 1. checks out the private source through a dedicated read-only deploy key;
 2. resolves the tag to one immutable source commit;
-3. builds and smoke-tests native Python sidecars on Windows x64, macOS Apple
+3. creates or resumes one draft and normalizes GitHub's temporary draft tag to the
+   requested source tag;
+4. builds and smoke-tests native Python sidecars on Windows x64, macOS Apple
    Silicon and macOS Intel;
-4. captures private build output instead of printing it to public logs;
-5. encrypts all intermediate installers before transferring them as temporary
+5. captures private build output instead of printing it to public logs;
+6. encrypts all intermediate installers before transferring them as temporary
    workflow artifacts;
-6. decrypts and uploads an exact four-file allowlist from a separate trusted
+7. decrypts and uploads an exact four-file allowlist from a separate trusted
    publisher job;
-7. publishes only after all assets and the source-tag SHA are verified.
+8. publishes only after all assets and the source-tag SHA are verified.
 
 See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the trust and release boundaries.
 
