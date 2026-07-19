@@ -55,10 +55,26 @@ def main() -> None:
 
     key_path = runner_temp / f"argus-deploy-{os.getpid()}.key"
     hooks_path = runner_temp / f"argus-empty-hooks-{os.getpid()}"
-    log_path = runner_temp / f"argus-checkout-{os.getpid()}.log"
+    log_path = runner_temp / "argus-private-logs" / "00-checkout.log"
     hooks_path.mkdir(parents=True, exist_ok=True)
-    key_path.write_text(required("ARGUS_DEPLOY_KEY").rstrip() + "\n", encoding="utf-8")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    key_content = required("ARGUS_DEPLOY_KEY").replace("\r\n", "\n").rstrip() + "\n"
+    key_path.write_bytes(key_content.encode("utf-8"))
     key_path.chmod(0o600)
+    if os.name == "nt":
+        acl = subprocess.run(
+            [
+                "icacls",
+                str(key_path),
+                "/inheritance:r",
+                "/grant:r",
+                f"{os.environ['USERNAME']}:R",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if acl.returncode != 0:
+            raise RuntimeError("Could not restrict the private checkout key ACL.")
     shutil.rmtree(destination, ignore_errors=True)
 
     environment = os.environ.copy()
@@ -89,6 +105,7 @@ def main() -> None:
         }
     )
 
+    checkout_succeeded = False
     try:
         with log_path.open("w", encoding="utf-8", errors="replace") as log:
             run_git(["init", "--quiet", str(destination)], environment=environment, log=log)
@@ -169,11 +186,13 @@ def main() -> None:
             ).stdout.strip()
         if COMMIT_REF.fullmatch(reference) and source_sha != reference:
             raise RuntimeError("Private source checkout resolved to the wrong commit.")
+        checkout_succeeded = True
         print(f"Checked out private source at {source_sha[:12]}.")
     finally:
         key_path.unlink(missing_ok=True)
         shutil.rmtree(hooks_path, ignore_errors=True)
-        log_path.unlink(missing_ok=True)
+        if checkout_succeeded:
+            log_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
